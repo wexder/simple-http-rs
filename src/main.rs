@@ -1,25 +1,28 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fmt,
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    ops::Deref,
-    time::Instant,
-};
+use std::io;
+use std::{collections::HashMap, fmt, ops::Deref, time::Instant};
 use thiserror::Error;
-use threadpool::ThreadPool;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream};
+use tokio::net::{TcpListener, TcpStream};
 
-fn main() {
-    let listener = TcpListener::bind("0.0.0.0:4488").unwrap();
-    let pool = ThreadPool::new(10);
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:4488").await?;
 
-    for stream in listener.incoming() {
-        pool.execute(move || {
-            let stream = stream.unwrap();
-            let buf_reader = BufReader::new(&stream);
-            println!("Connected {:?}", stream.peer_addr());
-            handle_connection(&stream, buf_reader);
+    loop {
+        let (mut socket, peer_addr) = listener.accept().await?;
+        println!("Connected {:?}", peer_addr);
+        tokio::spawn(async move {
+            loop {
+                if socket.readable().await.is_ok() && socket.writable().await.is_ok() {
+                    let mut stream = BufStream::new(&mut socket);
+                    // Copy data here
+                    let keep_alive = handle_connection(&mut stream).await;
+                    if !keep_alive {
+                        break;
+                    }
+                }
+            }
         });
     }
 }
@@ -118,14 +121,14 @@ struct Request {
     keep_alive: bool,
 }
 
-fn handle_connection(stream: &TcpStream, mut buf_reader: BufReader<&TcpStream>) -> bool {
+async fn handle_connection<'a>(stream: &'a mut BufStream<&mut TcpStream>) -> bool {
     let now = Instant::now();
     let mut request: Request;
 
     let mut http_header: Vec<_> = Vec::new();
-    match buf_reader.read_until(b'\n', &mut http_header) {
+    match stream.read_until(b'\n', &mut http_header).await {
         Ok(len) => {
-            println!("Buf read took {} milis.", now.elapsed().as_millis());
+            println!("Buf read {} took {} milis.", len, now.elapsed().as_micros());
             if len == 0 {
                 return false;
             }
@@ -134,12 +137,13 @@ fn handle_connection(stream: &TcpStream, mut buf_reader: BufReader<&TcpStream>) 
             let parts: Vec<_> = str.split(" ").collect();
             if parts.len() != 3 {
                 send_response(
-                    &stream,
+                    stream,
                     HTTPCodes::BadRequest,
                     Headers::new(),
                     false,
                     "".to_string(),
-                );
+                )
+                .await;
                 return false;
             }
             request = Request {
@@ -153,21 +157,22 @@ fn handle_connection(stream: &TcpStream, mut buf_reader: BufReader<&TcpStream>) 
         }
         Err(_) => {
             send_response(
-                &stream,
+                stream,
                 HTTPCodes::BadRequest,
                 Headers::new(),
                 false,
                 "".to_string(),
-            );
+            )
+            .await;
             return false;
         }
     };
-    println!("Header line took {} milis.", now.elapsed().as_millis());
+    println!("Header line took {} milis.", now.elapsed().as_micros());
     let now = Instant::now();
 
     loop {
         let mut chunk: Vec<_> = Vec::new();
-        let len = buf_reader.read_until(b'\n', &mut chunk).unwrap();
+        let len = stream.read_until(b'\n', &mut chunk).await.unwrap();
         if len <= 2 {
             break;
         }
@@ -186,43 +191,39 @@ fn handle_connection(stream: &TcpStream, mut buf_reader: BufReader<&TcpStream>) 
             request.keep_alive = false;
         }
     }
-    println!("Heades took {} milis.", now.elapsed().as_millis());
+    println!("Heades took {} milis.", now.elapsed().as_micros());
     let now = Instant::now();
     println!("Request {:?}", request);
 
     if let Ok(length) = request.headers.get_content_length() {
         let mut body = vec![0; length];
-        buf_reader.read_exact(&mut body).unwrap();
+        stream.read(&mut body).await.unwrap();
         request.body = body;
     };
-    println!("Body took {} milis.", now.elapsed().as_millis());
+    println!("Body took {} milis.", now.elapsed().as_micros());
     let now = Instant::now();
     let mut headers = Headers::new();
-    // headers.add("Content-type".to_string(), "application/json".to_string());
+    headers.add("Content-type".to_string(), "application/json".to_string());
     headers.add(
         "Host".to_string(),
         request.headers.get("Host".to_string()).unwrap(),
     );
 
     send_response(
-        &stream,
+        stream,
         HTTPCodes::NoContent,
         headers,
         request.keep_alive,
-        // "{\"name\": \"dick\"}".to_string(),
         "".to_string(),
-    );
+    )
+    .await;
 
-    println!("Resp took {} milis.", now.elapsed().as_millis());
-    if request.keep_alive {
-        handle_connection(stream, buf_reader)
-    } else {
-        false
-    }
+    println!("Resp took {} milis.", now.elapsed().as_micros());
+    request.keep_alive
 }
 
-fn send_response(
-    mut stream: &TcpStream,
+async fn send_response<'a>(
+    stream: &'a mut BufStream<&mut TcpStream>,
     status_code: HTTPCodes,
     mut headers: Headers,
     keep_alive: bool,
@@ -241,11 +242,13 @@ fn send_response(
 
     stream
         .write_all(format!("HTTP/1.1 {}\r\n", status_code.as_str()).as_bytes())
+        .await
         .unwrap();
 
     for (key, value) in headers.iter() {
         stream
             .write_all(format!("{}: {}\r\n", key, value).as_bytes())
+            .await
             .expect(
                 format!(
                     "Failed to write header status: {:?} body:{:?}",
@@ -254,13 +257,13 @@ fn send_response(
                 .as_str(),
             );
     }
-    stream.write_all("\r\n".as_bytes()).unwrap();
+    stream.write_all("\r\n".as_bytes()).await.unwrap();
     if body.len() > 0 {
-        stream.write_all(body.as_bytes()).unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
     }
     let elapsed_time = now.elapsed();
     println!("Writing took {} seconds.", elapsed_time.as_millis());
-    stream.flush().unwrap();
+    stream.flush().await.unwrap();
 
     let elapsed_time = now.elapsed();
     println!("Flushing took {} seconds.", elapsed_time.as_millis());
